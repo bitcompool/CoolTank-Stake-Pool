@@ -1,0 +1,169 @@
+//@version=6
+
+commissionTooltip = "Round-trip commission in percent (e.g., 0.05 = 5 bps)."
+commissionPct = input.float(0.05, "Commission (%)", minval=0.0, tooltip=commissionTooltip)
+slippageTooltip = "Additional ticks applied to order fills to approximate slippage."
+slippageTicks = input.int(1, "Slippage (ticks)", minval=0, tooltip=slippageTooltip)
+
+strategy(title="Crypto Trend Following (Production)", shorttitle="CTF Production", overlay=true, calc_on_every_tick=false, pyramiding=0, initial_capital=100000, currency=currency.USD, commission_type=strategy.commission.percent, commission_value=commissionPct / 100.0, slippage=slippageTicks)
+
+// === General inputs ===
+var string defaultTooltip = "Defaults follow the research prototype: EWMAC 8/32 gate and RSI normalization (RSI-50)/25."
+fastLen = input.int(8, "Fast EMA Length", minval=1, tooltip=defaultTooltip)
+slowLen = input.int(32, "Slow EMA Length", minval=2, tooltip="Slow EMA for the EWMAC gate. Keep > Fast.")
+rsiLen = input.int(56, "RSI Length", minval=2, tooltip="BTC/ETH/DOGE defaults: 56/14/7 respectively per research notes.")
+levMax = input.float(2.0, "Max Leverage (x)", minval=0.1, tooltip="Cap on absolute exposure multiplier.")
+longOnly = input.bool(true, "Long Only", tooltip="When enabled, short signals are blocked even if the EWMAC gate turns negative.")
+expSmoothLen = input.int(5, "Exposure EMA Length", minval=1, tooltip="EMA smoothing applied to the gated RSI signal before sizing.")
+rebalanceThreshold = input.float(0.05, "Rebalance Threshold (Δx)", minval=0.0, tooltip="Minimum change in desired exposure (in x) before sending a new order.")
+minBarSpacing = input.int(1, "Min Bars Between Rebalances", minval=0, tooltip="Prevents rebalancing more frequently than this number of bars.")
+maxDailyTrades = input.int(6, "Max Trades Per Day", minval=1, tooltip="Circuit breaker to limit the number of rebalances per calendar day.")
+useSessionFilter = input.bool(false, "Use Trading Session Filter", tooltip="Enable to restrict trading to a custom session.")
+tradingSession = input.session("24x7", "Trading Session", tooltip="Session during which new trades are allowed. Uses exchange time.")
+signalTf = input.timeframe("", "Signal Timeframe", tooltip="Optional higher timeframe (e.g., 1D) for signal calculations. Leave empty to use chart timeframe.")
+decayHalfLife = input.float(0.0, "Position Decay Half-Life", minval=0.0, tooltip="Optional half-life (in bars) that mean-reverts exposure toward 0 when no new signals.")
+
+// === Volatility targeting inputs ===
+volModel = input.string("ATR%", "Volatility Model", options=["ATR%", "Parkinson", "EWMA"], tooltip="Choose annualized volatility estimator for sizing.")
+atrLen = input.int(20, "ATR Length", minval=1)
+parkinsonLen = input.int(20, "Parkinson Length", minval=1)
+ewmaLen = input.int(20, "EWMA Length", minval=1, tooltip="Span for EWMA of squared returns.")
+targetVolPct = input.float(20.0, "Target Volatility (%)", minval=0.1, tooltip="Desired annualized volatility of the strategy.")
+barsPerYear = input.int(365, "Bars Per Year", minval=1, tooltip="Approximate number of bars per trading year for annualization.")
+volEps = input.float(1e-6, "Volatility Floor", minval=1e-8, tooltip="Prevents division by zero when annualized volatility is extremely low.")
+slippageBps = input.float(2.0, "Extra Slippage (bps)", minval=0.0, tooltip="Additional basis points applied to limit prices on fills.")
+
+// === Data sourcing ===
+resolvedTf = signalTf == "" ? timeframe.period : signalTf
+srcClose = request.security(syminfo.tickerid, resolvedTf, close, lookahead=barmerge.lookahead_off)
+srcHigh = request.security(syminfo.tickerid, resolvedTf, high, lookahead=barmerge.lookahead_off)
+srcLow = request.security(syminfo.tickerid, resolvedTf, low, lookahead=barmerge.lookahead_off)
+
+// === Signal computation ===
+fastEma = ta.ema(srcClose, fastLen)
+slowEma = ta.ema(srcClose, slowLen)
+ewmacGate = fastEma - slowEma
+
+rsiValue = ta.rsi(srcClose, rsiLen)
+rsiNorm = (rsiValue - 50.0) / 25.0
+rsiClamped = math.clamp(rsiNorm, longOnly ? 0.0 : -levMax, levMax)
+
+var float gateState = 0.0
+gateState := ewmacGate > 0 ? 1.0 : ewmacGate < 0 ? -1.0 : nz(gateState[1], 0.0)
+allowedSignal = longOnly ? (gateState > 0 ? math.max(rsiClamped, 0.0) : 0.0) : (gateState > 0 ? math.max(rsiClamped, 0.0) : gateState < 0 ? math.min(rsiClamped, 0.0) : 0.0)
+
+smoothedSignal = nz(ta.ema(allowedSignal, expSmoothLen), 0.0)
+
+if decayHalfLife > 0 and math.abs(allowedSignal) < 1e-5
+    decayFactor = math.pow(0.5, 1.0 / decayHalfLife)
+    smoothedSignal := smoothedSignal * decayFactor
+
+// === Volatility estimation ===
+atrPct = ta.atr(atrLen) / close
+parkComponent = math.pow(math.log(high / low), 2.0)
+parkinsonVar = ta.sma(parkComponent, parkinsonLen) / (4.0 * math.log(2.0))
+parkinsonVol = math.sqrt(math.max(parkinsonVar, 0.0))
+ret = math.log(close / close[1])
+ewmaVar = ta.ema(math.pow(ret, 2.0), ewmaLen)
+ewmaVol = math.sqrt(math.max(ewmaVar, 0.0))
+
+volRaw = volModel == "ATR%" ? atrPct : volModel == "Parkinson" ? parkinsonVol : ewmaVol
+volAnnualized = volRaw * math.sqrt(barsPerYear)
+targetVol = targetVolPct / 100.0
+
+validVol = volAnnualized > volEps
+positionSignal = validVol ? smoothedSignal * (targetVol / math.max(volAnnualized, volEps)) : 0.0
+positionClamped = nz(math.clamp(positionSignal, longOnly ? 0.0 : -levMax, levMax), 0.0)
+
+// === Exposure & execution state ===
+var float desiredExposure = 0.0
+desiredExposure := positionClamped
+
+positionValue = strategy.position_size * close
+currentExposure = strategy.equity > 0 ? positionValue / strategy.equity : 0.0
+exposureDelta = desiredExposure - currentExposure
+
+var int lastRebalanceBar = na
+barSpacingOk = na(lastRebalanceBar) or bar_index - lastRebalanceBar >= minBarSpacing
+
+currentSessionOk = not useSessionFilter or session.ismarket(tradingSession, time, syminfo.timezone)
+
+var int lastDay = na
+var int tradesToday = 0
+currentDay = dayofyear(time)
+if currentDay != nz(lastDay)
+    tradesToday := 0
+    lastDay := currentDay
+
+rebalanceNeeded = math.abs(exposureDelta) > rebalanceThreshold and validVol
+canTrade = rebalanceNeeded and barSpacingOk and tradesToday < maxDailyTrades and currentSessionOk and barstate.isconfirmed
+
+priceBuffer = close * (slippageBps / 10000.0)
+limitPrice = exposureDelta > 0 ? close + priceBuffer : close - priceBuffer
+useLimit = slippageBps > 0
+
+if canTrade
+    orderDirection = exposureDelta > 0 ? strategy.long : strategy.short
+    qtyPercent = math.abs(exposureDelta) * 100.0
+    strategy.order("Rebalance", orderDirection, qty_percent=qtyPercent, limit=useLimit ? limitPrice : na)
+    lastRebalanceBar := bar_index
+    tradesToday += 1
+
+// === Monitoring metrics ===
+var float cumAbsExposure = 0.0
+var float cumTurnover = 0.0
+var int barCounter = 0
+
+if barstate.isconfirmed
+    cumAbsExposure += math.abs(currentExposure)
+    barCounter += 1
+
+if canTrade
+    cumTurnover += math.abs(exposureDelta)
+
+avgExposure = barCounter > 0 ? cumAbsExposure / barCounter : na
+turnover = barCounter > 0 ? cumTurnover / barCounter : na
+winRate = strategy.closedtrades > 0 ? strategy.wintrades / strategy.closedtrades * 100.0 : na
+profitFactor = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : na
+var float peakEquity = strategy.equity
+peakEquity := math.max(peakEquity, strategy.equity)
+drawdownPct = peakEquity > 0 ? (strategy.equity - peakEquity) / peakEquity * 100.0 : 0.0
+var float maxDrawdownPct = 0.0
+maxDrawdownPct := math.min(maxDrawdownPct, drawdownPct)
+
+// === Table output ===
+var table metricsTable = table.new(position.top_right, 2, 5, frame_color=color.new(color.gray, 70), border_width=1)
+if barstate.islast
+    table.cell(metricsTable, 0, 0, "Avg Exposure", text_color=color.white)
+    table.cell(metricsTable, 1, 0, avgExposure != na ? str.tostring(avgExposure, format.mintick) : "na", text_color=color.white)
+    table.cell(metricsTable, 0, 1, "Turnover / bar", text_color=color.white)
+    table.cell(metricsTable, 1, 1, turnover != na ? str.tostring(turnover, format.mintick) : "na", text_color=color.white)
+    table.cell(metricsTable, 0, 2, "Win Rate", text_color=color.white)
+    table.cell(metricsTable, 1, 2, winRate != na ? str.tostring(winRate, format.mintick) + "%" : "na", text_color=color.white)
+    table.cell(metricsTable, 0, 3, "Profit Factor", text_color=color.white)
+    table.cell(metricsTable, 1, 3, profitFactor != na ? str.tostring(profitFactor, format.mintick) : "na", text_color=color.white)
+    table.cell(metricsTable, 0, 4, "Max DD", text_color=color.white)
+    table.cell(metricsTable, 1, 4, str.tostring(maxDrawdownPct, format.mintick) + "%", text_color=color.white)
+
+// === Plots ===
+plot(fastEma, title="Fast EMA", color=color.orange)
+plot(slowEma, title="Slow EMA", color=color.blue)
+plot(desiredExposure, title="Desired Exposure (x)", color=color.new(color.green, 0), linewidth=2, display=display.pane)
+plot(volAnnualized * 100.0, title="Ann. Volatility (%)", color=color.new(color.yellow, 0), display=display.pane)
+plotchar(canTrade, title="Rebalance Trigger", char="•", location=location.abovebar, color=color.new(color.red, 0))
+
+// === Alerts ===
+alertcondition(canTrade and exposureDelta > 0, title="Increase Exposure", message="Rebalance increasing exposure by {{strategy.order.contracts}} units.")
+alertcondition(canTrade and exposureDelta < 0, title="Decrease Exposure", message="Rebalance reducing exposure by {{strategy.order.contracts}} units.")
+
+// === Error handling ===
+var label lowVolLabel = na
+if not validVol and barstate.isconfirmed
+    if na(lowVolLabel)
+        lowVolLabel := label.new(bar_index, high, "Volatility too low; sizing paused.", color=color.new(color.red, 70), textcolor=color.white, style=label.style_label_down)
+    else
+        label.set_x(lowVolLabel, bar_index)
+        label.set_y(lowVolLabel, high)
+else if validVol and not na(lowVolLabel)
+    label.delete(lowVolLabel)
+    lowVolLabel := na
